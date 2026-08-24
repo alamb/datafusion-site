@@ -1,0 +1,117 @@
+# Builds the Pelican site and deploys it to GitHub Pages to preview a fork.
+#
+# This file is meant to live ONLY on the fork's default branch (main), NOT on a
+# feature/PR branch, so it never shows up in an upstream pull request.
+# `workflow_dispatch` only offers a "Run workflow" button for workflows that
+# exist on the default branch, which is why it has to live there.
+#
+# Served at: https://<user>.github.io/<repo>/blog/
+#   github.com/alamb/datafusion-site -> https://alamb.github.io/datafusion-site/blog/
+#
+# One-time setup in your fork:
+#   1. Actions tab -> enable workflows (forks disable them by default).
+#   2. Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+#
+# To preview a branch:
+#   Actions -> "Preview on GitHub Pages" -> Run workflow, and enter the branch
+#   to build in the "ref" box. The workflow itself runs from the default branch
+#   (where this file lives) but checks out and builds the branch you name, so
+#   the branch under review needs no changes at all.
+#
+# The preview URL is printed in the run summary once the deploy finishes.
+
+name: Preview on GitHub Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or ref to build and preview"
+        default: "main"
+        required: true
+
+# Permissions required by actions/deploy-pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel an in-progress one.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build site with ASF Pelican
+        # Same action and settings as .github/workflows/publish-site.yml, but
+        # with publish=false so it builds into `pelican-output/` instead of
+        # committing the result to the asf-site branch.
+        uses: apache/infrastructure-actions/pelican@main
+        with:
+          gfm: 'false'
+          publish: 'false'
+          tempdir: 'pelican-output'
+
+      - name: Assemble preview site
+        # The production site is served from https://datafusion.apache.org/blog,
+        # and both the theme templates and the blog posts hard-code root-relative
+        # links such as `href="/blog/css/app.css"` and `src="/blog/images/x.png"`.
+        # A fork's Pages site is served from a subpath (e.g. /datafusion-site),
+        # so those links would resolve to https://<user>.github.io/blog/... and
+        # 404. Nesting the output under `blog/` and prefixing every `="/blog/`
+        # with the Pages base path makes them resolve, and keeps preview URLs
+        # otherwise identical to production.
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          set -euo pipefail
+          # "/datafusion-site" -> "/datafusion-site"; "/" -> "" (user/org page)
+          prefix="${BASE_PATH%/}"
+          mkdir -p _site/blog
+          cp -R pelican-output/. _site/blog/
+          if [ -n "$prefix" ]; then
+            find _site -type f \( -name '*.html' -o -name '*.xml' \) -print0 \
+              | xargs -0 perl -pi -e "s{=\"/blog/}{=\"${prefix}/blog/}g"
+          fi
+          # The site itself lives under /blog/; point the Pages root at it.
+          cat > _site/index.html <<'EOF'
+          <!DOCTYPE html>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=./blog/">
+          <title>Redirecting to the Apache DataFusion blog preview</title>
+          <a href="./blog/">Continue to the Apache DataFusion blog preview</a>
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Report preview URL
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+          REF: ${{ github.event.inputs.ref }}
+        run: |
+          echo "Rendered preview of \`${REF}\`: ${PAGE_URL%/}/blog/" >> "$GITHUB_STEP_SUMMARY"
